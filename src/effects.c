@@ -36,6 +36,7 @@
 /* Jack */
 #include <jack/jack.h>
 #include <jack/midiport.h>
+#include <jack/transport.h>
 
 /* LV2 and Lilv */
 #include <lilv/lilv.h>
@@ -74,6 +75,8 @@
 #endif
 
 #define LILV_NS_MOD "http://moddevices.com/ns/mod#"
+
+#define KX_TIME__TicksPerBeat "http://kxstudio.sf.net/ns/lv2ext/props#TimePositionTicksPerBeat"
 
 // custom jack flag used for cv
 // needed because we prefer jack2 which doesn't have metadata yet
@@ -136,7 +139,14 @@ enum PortHints {
     HINT_LOGARITHMIC   = 1 << 4,
     HINT_MONITORED     = 1 << 5, // outputs only
     // events
-    HINT_OLD_EVENT_API = 1 << 0,
+    HINT_TRANSPORT     = 1 << 0,
+    HINT_OLD_EVENT_API = 1 << 1,
+};
+
+enum PluginHints {
+    //HINT_TRANSPORT     = 1 << 0,
+    HINT_TRIGGERS        = 1 << 1,
+    HINT_OUTPUT_MONITORS = 1 << 2,
 };
 
 enum {
@@ -155,8 +165,9 @@ enum {
 enum PostPonedEventType {
     POSTPONED_PARAM_SET,
     POSTPONED_OUTPUT_MONITOR,
+    POSTPONED_MIDI_MAP,
     POSTPONED_PROGRAM_LISTEN,
-    POSTPONED_MIDI_MAP
+    POSTPONED_TRANSPORT,
 };
 
 
@@ -250,6 +261,8 @@ typedef struct EFFECT_T {
     int32_t control_index; // control/event input
     int32_t enabled_index;
     int32_t freewheel_index;
+    int32_t bpm_index;
+    int32_t speed_index;
 
     preset_t **presets;
     uint32_t presets_count;
@@ -266,9 +279,13 @@ typedef struct EFFECT_T {
     bool bypass;
     bool was_bypassed;
 
-    // avoids itenerating controls each cycle
-    bool has_triggers;
-    bool has_output_monitors;
+    // cached plugin information, avoids itenerating controls each cycle
+    enum PluginHints hints;
+
+    // previous transport state
+    bool transport_rolling;
+    uint32_t transport_frame;
+    double transport_bpm;
 } effect_t;
 
 typedef struct URIDS_T {
@@ -290,9 +307,11 @@ typedef struct URIDS_T {
     LV2_URID time_Position;
     LV2_URID time_bar;
     LV2_URID time_barBeat;
+    LV2_URID time_beat;
     LV2_URID time_beatUnit;
     LV2_URID time_beatsPerBar;
     LV2_URID time_beatsPerMinute;
+    LV2_URID time_ticksPerBeat;
     LV2_URID time_frame;
     LV2_URID time_speed;
 } urids_t;
@@ -307,8 +326,17 @@ typedef struct MIDI_CC_T {
     const port_t* port;
 } midi_cc_t;
 
-typedef struct POSTPONED_EVENT_T {
-    enum PostPonedEventType etype;
+typedef struct POSTPONED_PARAMETER_EVENT_T {
+    int effect_id;
+    const char* symbol;
+    float value;
+} postponed_parameter_event_t;
+
+typedef struct POSTPONED_PROGRAM_EVENT_T {
+    int8_t value;
+} postponed_program_event_t;
+
+typedef struct POSTPONED_MIDI_MAP_EVENT_T {
     int effect_id;
     const char* symbol;
     int8_t channel;
@@ -316,6 +344,21 @@ typedef struct POSTPONED_EVENT_T {
     float value;
     float minimum;
     float maximum;
+} postponed_midi_map_event_t;
+
+typedef struct POSTPONED_TRANSPORT_EVENT_T {
+    bool rolling;
+    float bpm;
+} postponed_transport_event_t;
+
+typedef struct POSTPONED_EVENT_T {
+    enum PostPonedEventType type;
+    union {
+        postponed_parameter_event_t parameter;
+        postponed_program_event_t program;
+        postponed_midi_map_event_t midi_map;
+        postponed_transport_event_t transport;
+    };
 } postponed_event_t;
 
 typedef struct POSTPONED_EVENT_LIST_DATA {
@@ -370,6 +413,8 @@ static jack_nframes_t g_sample_rate, g_block_length;
 static const char **g_capture_ports, **g_playback_ports;
 static size_t g_midi_buffer_size;
 static jack_port_t *g_midi_in_port;
+static jack_position_t g_jack_pos;
+static bool g_jack_rolling;
 
 /* LV2 and Lilv */
 static LilvWorld *g_lv2_data;
@@ -418,6 +463,7 @@ static void RunPostPonedEvents(int ignored_effect_id);
 static void* PostPonedEventsThread(void* arg);
 static int ProcessPlugin(jack_nframes_t nframes, void *arg);
 static float UpdateValueFromMidi(midi_cc_t* mcc, jack_midi_data_t mvalue);
+static void UpdateGlobalJackPosition(bool report_changes);
 static int ProcessMidi(jack_nframes_t nframes, void *arg);
 static void JackThreadInit(void *arg);
 static void GetFeatures(effect_t *effect);
@@ -500,14 +546,14 @@ static void FreeWheelMode(int starting, void* data)
     }
 }
 
-static bool ShouldIgnorePostPonedEvent(postponed_event_list_data* ev, postponed_cached_events* cached_events)
+static bool ShouldIgnorePostPonedEvent(postponed_parameter_event_t* ev, postponed_cached_events* cached_events)
 {
-    // we don't have symbol-less events that need caching
-    if (ev->event.symbol == NULL)
+    // symbol must not be null
+    if (ev->symbol == NULL)
         return false;
 
-    if (ev->event.effect_id == cached_events->last_effect_id &&
-        strncmp(ev->event.symbol, cached_events->last_symbol, MAX_CHAR_BUF_SIZE) == 0)
+    if (ev->effect_id == cached_events->last_effect_id &&
+        strncmp(ev->symbol, cached_events->last_symbol, MAX_CHAR_BUF_SIZE) == 0)
     {
         // already received this event, like just now
         return true;
@@ -520,8 +566,8 @@ static bool ShouldIgnorePostPonedEvent(postponed_event_list_data* ev, postponed_
     {
         postponed_cached_symbol_list_data* const psymbol = list_entry(it, postponed_cached_symbol_list_data, siblings);
 
-        if (ev->event.effect_id == psymbol->effect_id &&
-            strncmp(ev->event.symbol, psymbol->symbol, MAX_CHAR_BUF_SIZE) == 0)
+        if (ev->effect_id == psymbol->effect_id &&
+            strncmp(ev->symbol, psymbol->symbol, MAX_CHAR_BUF_SIZE) == 0)
         {
             // haha! found you little bastard!
             return true;
@@ -534,8 +580,8 @@ static bool ShouldIgnorePostPonedEvent(postponed_event_list_data* ev, postponed_
 
     if (psymbol)
     {
-        psymbol->effect_id = ev->event.effect_id;
-        strncpy(psymbol->symbol, ev->event.symbol, MAX_CHAR_BUF_SIZE);
+        psymbol->effect_id = ev->effect_id;
+        strncpy(psymbol->symbol, ev->symbol, MAX_CHAR_BUF_SIZE);
         psymbol->symbol[MAX_CHAR_BUF_SIZE] = '\0';
         list_add_tail(&psymbol->siblings, &cached_events->symbols.siblings);
     }
@@ -566,12 +612,15 @@ void RunPostPonedEvents(int ignored_effect_id)
 
     // cached data, to make sure we only handle similar events once
     bool got_midi_program = false;
+    bool got_transport = false;
     postponed_cached_events cached_param_set, cached_output_mon;
     postponed_cached_symbol_list_data *psymbol;
 
     cached_param_set.last_effect_id = -1;
     cached_output_mon.last_effect_id = -1;
+    cached_param_set.last_symbol[0] = '\0';
     cached_param_set.last_symbol[MAX_CHAR_BUF_SIZE] = '\0';
+    cached_output_mon.last_symbol[0] = '\0';
     cached_output_mon.last_symbol[MAX_CHAR_BUF_SIZE] = '\0';
     INIT_LIST_HEAD(&cached_param_set.symbols.siblings);
     INIT_LIST_HEAD(&cached_output_mon.symbols.siblings);
@@ -584,60 +633,74 @@ void RunPostPonedEvents(int ignored_effect_id)
     {
         eventptr = list_entry(it, postponed_event_list_data, siblings);
 
-        // do not handle events for a plugin that is about to be removed
-        if (eventptr->event.effect_id == ignored_effect_id)
-            continue;
-
-        switch (eventptr->event.etype)
+        switch (eventptr->event.type)
         {
         case POSTPONED_PARAM_SET:
-            if (ShouldIgnorePostPonedEvent(eventptr, &cached_param_set))
+            if (eventptr->event.parameter.effect_id == ignored_effect_id)
+                continue;
+            if (ShouldIgnorePostPonedEvent(&eventptr->event.parameter, &cached_param_set))
                 continue;
 
-            snprintf(buf, MAX_CHAR_BUF_SIZE, "param_set %i %s %f", eventptr->event.effect_id,
-                                                                   eventptr->event.symbol,
-                                                                   eventptr->event.value);
+            snprintf(buf, MAX_CHAR_BUF_SIZE, "param_set %i %s %f", eventptr->event.parameter.effect_id,
+                                                                   eventptr->event.parameter.symbol,
+                                                                   eventptr->event.parameter.value);
             socket_send_feedback(buf);
 
             // save for fast checkup next time
-            cached_param_set.last_effect_id = eventptr->event.effect_id;
-            strncpy(cached_param_set.last_symbol, eventptr->event.symbol, MAX_CHAR_BUF_SIZE);
+            cached_param_set.last_effect_id = eventptr->event.parameter.effect_id;
+            strncpy(cached_param_set.last_symbol, eventptr->event.parameter.symbol, MAX_CHAR_BUF_SIZE);
             break;
 
         case POSTPONED_OUTPUT_MONITOR:
-            if (ShouldIgnorePostPonedEvent(eventptr, &cached_output_mon))
+            if (eventptr->event.parameter.effect_id == ignored_effect_id)
+                continue;
+            if (ShouldIgnorePostPonedEvent(&eventptr->event.parameter, &cached_output_mon))
                 continue;
 
-            snprintf(buf, MAX_CHAR_BUF_SIZE, "output_set %i %s %f", eventptr->event.effect_id,
-                                                                    eventptr->event.symbol,
-                                                                    eventptr->event.value);
+            snprintf(buf, MAX_CHAR_BUF_SIZE, "output_set %i %s %f", eventptr->event.parameter.effect_id,
+                                                                    eventptr->event.parameter.symbol,
+                                                                    eventptr->event.parameter.value);
             socket_send_feedback(buf);
 
             // save for fast checkup next time
-            cached_output_mon.last_effect_id = eventptr->event.effect_id;
-            strncpy(cached_output_mon.last_symbol, eventptr->event.symbol, MAX_CHAR_BUF_SIZE);
+            cached_output_mon.last_effect_id = eventptr->event.parameter.effect_id;
+            strncpy(cached_output_mon.last_symbol, eventptr->event.parameter.symbol, MAX_CHAR_BUF_SIZE);
+            break;
+
+        case POSTPONED_MIDI_MAP:
+            if (eventptr->event.midi_map.effect_id == ignored_effect_id)
+                continue;
+            snprintf(buf, MAX_CHAR_BUF_SIZE, "midi_mapped %i %s %i %i %f %f %f", eventptr->event.midi_map.effect_id,
+                                                                                 eventptr->event.midi_map.symbol,
+                                                                                 eventptr->event.midi_map.channel,
+                                                                                 eventptr->event.midi_map.controller,
+                                                                                 eventptr->event.midi_map.value,
+                                                                                 eventptr->event.midi_map.minimum,
+                                                                                 eventptr->event.midi_map.maximum);
+            socket_send_feedback(buf);
             break;
 
         case POSTPONED_PROGRAM_LISTEN:
             if (got_midi_program)
                 continue;
 
-            snprintf(buf, MAX_CHAR_BUF_SIZE, "midi_program %i", eventptr->event.controller);
+            snprintf(buf, MAX_CHAR_BUF_SIZE, "midi_program %i", eventptr->event.program.value);
             socket_send_feedback(buf);
 
-            // ignore next midi program
+            // ignore next midi program changes
             got_midi_program = true;
             break;
 
-        case POSTPONED_MIDI_MAP:
-            snprintf(buf, MAX_CHAR_BUF_SIZE, "midi_mapped %i %s %i %i %f %f %f", eventptr->event.effect_id,
-                                                                                 eventptr->event.symbol,
-                                                                                 eventptr->event.channel,
-                                                                                 eventptr->event.controller,
-                                                                                 eventptr->event.value,
-                                                                                 eventptr->event.minimum,
-                                                                                 eventptr->event.maximum);
+        case POSTPONED_TRANSPORT:
+            if (got_transport)
+                continue;
+
+            snprintf(buf, MAX_CHAR_BUF_SIZE, "transport %i %f", eventptr->event.transport.rolling ? 1 : 0,
+                                                                eventptr->event.transport.bpm);
             socket_send_feedback(buf);
+
+            // ignore next transport changes
+            got_transport = true;
             break;
         }
     }
@@ -695,6 +758,72 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     if (arg == NULL) return 0;
     effect = arg;
 
+    /* transport */
+    uint8_t pos_buf[256];
+    LV2_Atom* lv2_pos = (LV2_Atom*)pos_buf;
+
+    if (effect->hints & HINT_TRANSPORT)
+    {
+        const bool rolling = g_jack_rolling;
+        const jack_position_t pos = g_jack_pos;
+
+        if (effect->transport_rolling != rolling ||
+            effect->transport_frame != pos.frame ||
+            effect->transport_bpm != pos.beats_per_minute ||
+            (!effect->bypass && effect->was_bypassed))
+        {
+            effect->transport_rolling = rolling;
+            effect->transport_frame = pos.frame;
+            effect->transport_bpm = pos.beats_per_minute;
+
+            LV2_Atom_Forge* forge = &g_lv2_atom_forge;
+            lv2_atom_forge_set_buffer(forge, pos_buf, sizeof(pos_buf));
+
+            LV2_Atom_Forge_Frame frame;
+            lv2_atom_forge_object(forge, &frame, 0, g_urids.time_Position);
+
+            lv2_atom_forge_key(forge, g_urids.time_speed);
+            lv2_atom_forge_float(forge, rolling ? 1.0f : 0.0f);
+
+            lv2_atom_forge_key(forge, g_urids.time_frame);
+            lv2_atom_forge_long(forge, pos.frame);
+
+            if (pos.valid & JackPositionBBT)
+            {
+                lv2_atom_forge_key(forge, g_urids.time_bar);
+                lv2_atom_forge_long(forge, pos.bar - 1);
+
+                lv2_atom_forge_key(forge, g_urids.time_barBeat);
+                lv2_atom_forge_float(forge, pos.beat - 1 + (pos.tick / pos.ticks_per_beat));
+
+                lv2_atom_forge_key(forge, g_urids.time_beat);
+                lv2_atom_forge_double(forge, pos.beat - 1);
+
+                lv2_atom_forge_key(forge, g_urids.time_beatUnit);
+                lv2_atom_forge_int(forge, pos.beat_type);
+
+                lv2_atom_forge_key(forge, g_urids.time_beatsPerBar);
+                lv2_atom_forge_float(forge, pos.beats_per_bar);
+
+                lv2_atom_forge_key(forge, g_urids.time_beatsPerMinute);
+                lv2_atom_forge_float(forge, pos.beats_per_minute);
+
+                lv2_atom_forge_key(forge, g_urids.time_ticksPerBeat);
+                lv2_atom_forge_double(forge, pos.ticks_per_beat);
+            }
+
+            lv2_atom_forge_pop(forge, &frame);
+        }
+    }
+    if (effect->bpm_index >= 0)
+    {
+        *(effect->ports[effect->bpm_index]->buffer) = g_jack_pos.beats_per_minute;
+    }
+    if (effect->speed_index >= 0)
+    {
+        *(effect->ports[effect->speed_index]->buffer) = g_jack_rolling ? 1.0f : 0.0f;
+    }
+
     /* Prepare midi/event ports */
     for (i = 0; i < effect->input_event_ports_count; i++)
     {
@@ -747,6 +876,9 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
                     fprintf(stderr, "lv2 evbuf write failed\n");
                 }
             }
+
+            /* Write time position */
+            lv2_evbuf_write(&iter, 0, 0, lv2_pos->type, lv2_pos->size, LV2_ATOM_BODY_CONST(lv2_pos));
         }
     }
 
@@ -939,7 +1071,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
         }
     }
 
-    if (effect->has_triggers)
+    if (effect->hints & HINT_TRIGGERS)
     {
         for (i = 0; i < effect->input_control_ports_count; i++)
         {
@@ -948,7 +1080,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
         }
     }
 
-    if (effect->has_output_monitors)
+    if (effect->hints & HINT_OUTPUT_MONITORS)
     {
         bool needs_post = false;
         float value;
@@ -970,16 +1102,10 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
 
             effect->output_control_ports[i]->prev_value = value;
 
-            const postponed_event_t pevent = {
-                POSTPONED_OUTPUT_MONITOR,
-                effect->instance,
-                effect->output_control_ports[i]->symbol,
-                -1, -1,
-                value,
-                0.0f, 0.0f
-            };
-
-            memcpy(&posteventptr->event, &pevent, sizeof(postponed_event_t));
+            posteventptr->event.type = POSTPONED_OUTPUT_MONITOR;
+            posteventptr->event.parameter.effect_id = effect->instance;
+            posteventptr->event.parameter.symbol    = effect->output_control_ports[i]->symbol;
+            posteventptr->event.parameter.value     = value;
 
             pthread_mutex_lock(&g_rtsafe_mutex);
             list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -1058,12 +1184,53 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, jack_midi_data_t mvalue)
     }
 }
 
+static void UpdateGlobalJackPosition(bool report_changes)
+{
+    bool old_rolling;
+    double old_bpm;
+
+    if (report_changes)
+    {
+        old_rolling = g_jack_rolling;
+        old_bpm = g_jack_pos.beats_per_minute;
+    }
+
+    g_jack_rolling = (jack_transport_query(g_jack_global_client, &g_jack_pos) == JackTransportRolling);
+
+    if ((g_jack_pos.valid & JackPositionBBT) == 0)
+    {
+        g_jack_pos.beats_per_minute = 120.0;
+    }
+
+    if (!report_changes)
+        return;
+    if (old_rolling == g_jack_rolling && old_bpm == g_jack_pos.beats_per_minute)
+        return;
+
+    postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+    if (!posteventptr)
+        return;
+
+    posteventptr->event.type = POSTPONED_TRANSPORT;
+    posteventptr->event.transport.rolling = g_jack_rolling;
+    posteventptr->event.transport.bpm     = g_jack_pos.beats_per_minute;
+
+    pthread_mutex_lock(&g_rtsafe_mutex);
+    list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+    pthread_mutex_unlock(&g_rtsafe_mutex);
+
+    sem_post(&g_postevents_semaphore);
+}
+
 static int ProcessMidi(jack_nframes_t nframes, void *arg)
 {
     jack_midi_event_t event;
     int8_t channel, controller;
     float value;
     bool handled, needs_post = false;
+
+    UpdateGlobalJackPosition(true);
 
     void *const port_buf = jack_port_get_buffer(g_midi_in_port, nframes);
     const jack_nframes_t event_count = jack_midi_get_event_count(port_buf);
@@ -1083,13 +1250,8 @@ static int ProcessMidi(jack_nframes_t nframes, void *arg)
 
             if (posteventptr)
             {
-                const postponed_event_t pevent = {
-                    POSTPONED_PROGRAM_LISTEN,
-                    -1, NULL, -1,
-                    event.buffer[1],
-                    0.0f, 0.0f, 0.0f
-                };
-                memcpy(&posteventptr->event, &pevent, sizeof(postponed_event_t));
+                posteventptr->event.type = POSTPONED_PROGRAM_LISTEN;
+                posteventptr->event.program.value = event.buffer[1];
 
                 pthread_mutex_lock(&g_rtsafe_mutex);
                 list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -1129,15 +1291,10 @@ static int ProcessMidi(jack_nframes_t nframes, void *arg)
 
                 if (posteventptr)
                 {
-                    const postponed_event_t pevent = {
-                        POSTPONED_PARAM_SET,
-                        g_midi_cc_list[i].effect_id,
-                        g_midi_cc_list[i].symbol,
-                        -1, -1,
-                        value,
-                        0.0f, 0.0f
-                    };
-                    memcpy(&posteventptr->event, &pevent, sizeof(postponed_event_t));
+                    posteventptr->event.type = POSTPONED_PARAM_SET;
+                    posteventptr->event.parameter.effect_id = g_midi_cc_list[i].effect_id;
+                    posteventptr->event.parameter.symbol    = g_midi_cc_list[i].symbol;
+                    posteventptr->event.parameter.value     = value;
 
                     pthread_mutex_lock(&g_rtsafe_mutex);
                     list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -1180,17 +1337,14 @@ static int ProcessMidi(jack_nframes_t nframes, void *arg)
 
                 if (posteventptr)
                 {
-                    const postponed_event_t pevent = {
-                        POSTPONED_MIDI_MAP,
-                        effect_id,
-                        symbol,
-                        channel,
-                        controller,
-                        value,
-                        minimum,
-                        maximum
-                    };
-                    memcpy(&posteventptr->event, &pevent, sizeof(postponed_event_t));
+                    posteventptr->event.type = POSTPONED_MIDI_MAP;
+                    posteventptr->event.midi_map.effect_id  = effect_id;
+                    posteventptr->event.midi_map.symbol     = symbol;
+                    posteventptr->event.midi_map.channel    = channel;
+                    posteventptr->event.midi_map.controller = controller;
+                    posteventptr->event.midi_map.value      = value;
+                    posteventptr->event.midi_map.minimum    = minimum;
+                    posteventptr->event.midi_map.maximum    = maximum;
 
                     pthread_mutex_lock(&g_rtsafe_mutex);
                     list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -1581,6 +1735,9 @@ int effects_init(void* client)
         return ERR_JACK_CLIENT_ACTIVATION;
     }
 
+    /* get transport state */
+    UpdateGlobalJackPosition(false);
+
     /* Connect to all good hw ports (system, ttymidi and nooice) */
     const char** const midihwports = jack_get_ports(g_jack_global_client, "", JACK_DEFAULT_MIDI_TYPE,
                                                                               JackPortIsOutput|JackPortIsPhysical);
@@ -1646,9 +1803,11 @@ int effects_init(void* client)
     g_urids.time_Position        = urid_to_id(g_symap, LV2_TIME__Position);
     g_urids.time_bar             = urid_to_id(g_symap, LV2_TIME__bar);
     g_urids.time_barBeat         = urid_to_id(g_symap, LV2_TIME__barBeat);
+    g_urids.time_beat            = urid_to_id(g_symap, LV2_TIME__beat);
     g_urids.time_beatUnit        = urid_to_id(g_symap, LV2_TIME__beatUnit);
     g_urids.time_beatsPerBar     = urid_to_id(g_symap, LV2_TIME__beatsPerBar);
     g_urids.time_beatsPerMinute  = urid_to_id(g_symap, LV2_TIME__beatsPerMinute);
+    g_urids.time_ticksPerBeat    = urid_to_id(g_symap, KX_TIME__TicksPerBeat);
     g_urids.time_frame           = urid_to_id(g_symap, LV2_TIME__frame);
     g_urids.time_speed           = urid_to_id(g_symap, LV2_TIME__speed);
 
@@ -1773,6 +1932,7 @@ int effects_add(const char *uid, int instance)
     LilvInstance *lilv_instance;
     LilvNode *plugin_uri;
     LilvNode *lilv_input, *lilv_control_in, *lilv_enabled, *lilv_freeWheeling, *lilv_output;
+    LilvNode *lilv_timePosition, *lilv_timeBeatsPerMinute, *lilv_timeSpeed;
     LilvNode *lilv_enumeration, *lilv_integer, *lilv_toggled, *lilv_trigger, *lilv_logarithmic;
     LilvNode *lilv_control, *lilv_audio, *lilv_cv, *lilv_event, *lilv_midi;
     LilvNode *lilv_default, *lilv_mod_default;
@@ -1799,6 +1959,9 @@ int effects_add(const char *uid, int instance)
     lilv_enabled = NULL;
     lilv_enumeration = NULL;
     lilv_freeWheeling = NULL;
+    lilv_timePosition = NULL;
+    lilv_timeBeatsPerMinute = NULL;
+    lilv_timeSpeed = NULL;
     lilv_integer = NULL;
     lilv_toggled = NULL;
     lilv_trigger = NULL;
@@ -1910,6 +2073,9 @@ int effects_add(const char *uid, int instance)
     lilv_enabled = lilv_new_uri(g_lv2_data, LV2_CORE__enabled);
     lilv_enumeration = lilv_new_uri(g_lv2_data, LV2_CORE__enumeration);
     lilv_freeWheeling = lilv_new_uri(g_lv2_data, LV2_CORE__freeWheeling);
+    lilv_timePosition = lilv_new_uri(g_lv2_data, LV2_TIME__Position);
+    lilv_timeBeatsPerMinute = lilv_new_uri(g_lv2_data, LV2_TIME__beatsPerMinute);
+    lilv_timeSpeed = lilv_new_uri(g_lv2_data, LV2_TIME__speed);
     lilv_integer = lilv_new_uri(g_lv2_data, LV2_CORE__integer);
     lilv_toggled = lilv_new_uri(g_lv2_data, LV2_CORE__toggled);
     lilv_trigger = lilv_new_uri(g_lv2_data, LV2_PORT_PROPS__trigger);
@@ -2093,7 +2259,7 @@ int effects_add(const char *uid, int instance)
             if (lilv_port_has_property(plugin, lilv_port, lilv_trigger))
             {
                 effect->ports[i]->hints |= HINT_TRIGGER;
-                effect->has_triggers = true;
+                effect->hints |= HINT_TRIGGERS;
             }
             if (lilv_port_has_property(plugin, lilv_port, lilv_logarithmic))
             {
@@ -2151,7 +2317,15 @@ int effects_add(const char *uid, int instance)
         {
             effect->ports[i]->type = TYPE_EVENT;
             if (lilv_port_is_a(plugin, lilv_port, lilv_event))
+            {
                 effect->ports[i]->hints |= HINT_OLD_EVENT_API;
+            }
+            else if (lilv_port_supports_event(plugin, lilv_port, lilv_timePosition))
+            {
+                effect->ports[i]->hints |= HINT_TRANSPORT;
+                effect->hints |= HINT_TRANSPORT;
+            }
+
             jack_port = jack_port_register(jack_client, port_name, JACK_DEFAULT_MIDI_TYPE, jack_flags, 0);
             if (jack_port == NULL)
             {
@@ -2197,6 +2371,28 @@ int effects_add(const char *uid, int instance)
     else
     {
         effect->freewheel_index = -1;
+    }
+
+    const LilvPort* bpm_port = lilv_plugin_get_port_by_designation(plugin, lilv_input, lilv_timeBeatsPerMinute);
+    if (bpm_port)
+    {
+        effect->bpm_index = lilv_port_get_index(plugin, bpm_port);
+        *(effect->ports[effect->bpm_index]->buffer) = g_jack_pos.beats_per_minute;
+    }
+    else
+    {
+        effect->bpm_index = -1;
+    }
+
+    const LilvPort* speed_port = lilv_plugin_get_port_by_designation(plugin, lilv_input, lilv_timeSpeed);
+    if (speed_port)
+    {
+        effect->speed_index = lilv_port_get_index(plugin, speed_port);
+        *(effect->ports[effect->speed_index]->buffer) = g_jack_rolling ? 1.0f : 0.0f;
+    }
+    else
+    {
+        effect->speed_index = -1;
     }
 
 
@@ -2361,6 +2557,9 @@ int effects_add(const char *uid, int instance)
     lilv_node_free(lilv_enabled);
     lilv_node_free(lilv_enumeration);
     lilv_node_free(lilv_freeWheeling);
+    lilv_node_free(lilv_timePosition);
+    lilv_node_free(lilv_timeBeatsPerMinute);
+    lilv_node_free(lilv_timeSpeed);
     lilv_node_free(lilv_integer);
     lilv_node_free(lilv_toggled);
     lilv_node_free(lilv_trigger);
@@ -2413,6 +2612,9 @@ int effects_add(const char *uid, int instance)
         lilv_node_free(lilv_enabled);
         lilv_node_free(lilv_enumeration);
         lilv_node_free(lilv_freeWheeling);
+        lilv_node_free(lilv_timePosition);
+        lilv_node_free(lilv_timeBeatsPerMinute);
+        lilv_node_free(lilv_timeSpeed);
         lilv_node_free(lilv_integer);
         lilv_node_free(lilv_toggled);
         lilv_node_free(lilv_trigger);
@@ -2463,6 +2665,14 @@ int effects_preset_load(int effect_id, const char *uri)
             if (effect->freewheel_index >= 0)
             {
                 *(effect->ports[effect->freewheel_index]->buffer) = 0.0f;
+            }
+            if (effect->bpm_index >= 0)
+            {
+                *(effect->ports[effect->bpm_index]->buffer) = g_jack_pos.beats_per_minute;
+            }
+            if (effect->speed_index >= 0)
+            {
+                *(effect->ports[effect->speed_index]->buffer) = g_jack_rolling ? 1.0f : 0.0f;
             }
 
             return SUCCESS;
@@ -2885,7 +3095,7 @@ int effects_monitor_output_parameter(int effect_id, const char *control_symbol)
     port->hints |= HINT_MONITORED;
 
     // activate output monitor
-    g_effects[effect_id].has_output_monitors = true;
+    g_effects[effect_id].hints |= HINT_OUTPUT_MONITORS;
 
     return SUCCESS;
 }
