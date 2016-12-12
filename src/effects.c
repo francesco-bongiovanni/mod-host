@@ -1201,7 +1201,11 @@ static void UpdateGlobalJackPosition(bool report_changes)
 
     g_jack_rolling = (jack_transport_query(g_jack_global_client, &g_jack_pos) == JackTransportRolling);
 
-    if ((g_jack_pos.valid & JackPositionBBT) == 0)
+    if (g_jack_pos.valid & JackPositionBBT)
+    {
+        g_transport_bpm = g_jack_pos.beats_per_minute;
+    }
+    else
     {
         g_jack_pos.beats_per_minute = g_transport_bpm;
     }
@@ -3570,6 +3574,12 @@ void effects_bundle_remove(const char* bpath)
 
 void effects_transport(int rolling, double bpm)
 {
+    if ((g_jack_pos.valid & JackPositionBBT) == 0)
+    {
+        // old timebase master no longer active, make ourselves master again
+        jack_set_timebase_callback(g_jack_global_client, 1, JackTimebase, NULL);
+    }
+
     if (g_transport_bpm != bpm)
     {
         g_transport_bpm = bpm;
