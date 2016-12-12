@@ -2602,7 +2602,7 @@ int effects_add(const char *uid, int instance)
 
     /* Default value of bypass */
     effect->bypass = false;
-    effect->was_bypassed = false;
+    effect->was_bypassed = true;
 
     lilv_node_free(lilv_audio);
     lilv_node_free(lilv_control);
