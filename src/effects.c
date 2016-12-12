@@ -3577,10 +3577,11 @@ void effects_transport(int rolling, double bpm)
     if ((g_jack_pos.valid & JackPositionBBT) == 0)
     {
         // old timebase master no longer active, make ourselves master again
+        g_transport_bpm = bpm;
+        g_transport_reset = true;
         jack_set_timebase_callback(g_jack_global_client, 1, JackTimebase, NULL);
     }
-
-    if (g_transport_bpm != bpm)
+    else if (g_transport_bpm != bpm)
     {
         g_transport_bpm = bpm;
         g_transport_reset = true;
