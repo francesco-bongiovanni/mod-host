@@ -415,6 +415,8 @@ static size_t g_midi_buffer_size;
 static jack_port_t *g_midi_in_port;
 static jack_position_t g_jack_pos;
 static bool g_jack_rolling;
+static volatile double g_transport_bpm;
+static volatile bool g_transport_reset;
 
 /* LV2 and Lilv */
 static LilvWorld *g_lv2_data;
@@ -465,6 +467,8 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg);
 static float UpdateValueFromMidi(midi_cc_t* mcc, jack_midi_data_t mvalue);
 static void UpdateGlobalJackPosition(bool report_changes);
 static int ProcessMidi(jack_nframes_t nframes, void *arg);
+static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
+                         jack_position_t* pos, int new_pos, void* arg);
 static void JackThreadInit(void *arg);
 static void GetFeatures(effect_t *effect);
 static void FreeFeatures(effect_t *effect);
@@ -776,48 +780,48 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
             effect->transport_frame = pos.frame;
             effect->transport_bpm = pos.beats_per_minute;
 
-            LV2_Atom_Forge* forge = &g_lv2_atom_forge;
-            lv2_atom_forge_set_buffer(forge, pos_buf, sizeof(pos_buf));
+            LV2_Atom_Forge forge = g_lv2_atom_forge;
+            lv2_atom_forge_set_buffer(&forge, pos_buf, sizeof(pos_buf));
 
             LV2_Atom_Forge_Frame frame;
-            lv2_atom_forge_object(forge, &frame, 0, g_urids.time_Position);
+            lv2_atom_forge_object(&forge, &frame, 0, g_urids.time_Position);
 
-            lv2_atom_forge_key(forge, g_urids.time_speed);
-            lv2_atom_forge_float(forge, rolling ? 1.0f : 0.0f);
+            lv2_atom_forge_key(&forge, g_urids.time_speed);
+            lv2_atom_forge_float(&forge, rolling ? 1.0f : 0.0f);
 
-            lv2_atom_forge_key(forge, g_urids.time_frame);
-            lv2_atom_forge_long(forge, pos.frame);
+            lv2_atom_forge_key(&forge, g_urids.time_frame);
+            lv2_atom_forge_long(&forge, pos.frame);
 
             if (pos.valid & JackPositionBBT)
             {
-                lv2_atom_forge_key(forge, g_urids.time_bar);
-                lv2_atom_forge_long(forge, pos.bar - 1);
+                lv2_atom_forge_key(&forge, g_urids.time_bar);
+                lv2_atom_forge_long(&forge, pos.bar - 1);
 
-                lv2_atom_forge_key(forge, g_urids.time_barBeat);
-                lv2_atom_forge_float(forge, pos.beat - 1 + (pos.tick / pos.ticks_per_beat));
+                lv2_atom_forge_key(&forge, g_urids.time_barBeat);
+                lv2_atom_forge_float(&forge, pos.beat - 1 + (pos.tick / pos.ticks_per_beat));
 
-                lv2_atom_forge_key(forge, g_urids.time_beat);
-                lv2_atom_forge_double(forge, pos.beat - 1);
+                lv2_atom_forge_key(&forge, g_urids.time_beat);
+                lv2_atom_forge_double(&forge, pos.beat - 1);
 
-                lv2_atom_forge_key(forge, g_urids.time_beatUnit);
-                lv2_atom_forge_int(forge, pos.beat_type);
+                lv2_atom_forge_key(&forge, g_urids.time_beatUnit);
+                lv2_atom_forge_int(&forge, pos.beat_type);
 
-                lv2_atom_forge_key(forge, g_urids.time_beatsPerBar);
-                lv2_atom_forge_float(forge, pos.beats_per_bar);
+                lv2_atom_forge_key(&forge, g_urids.time_beatsPerBar);
+                lv2_atom_forge_float(&forge, pos.beats_per_bar);
 
-                lv2_atom_forge_key(forge, g_urids.time_beatsPerMinute);
-                lv2_atom_forge_float(forge, pos.beats_per_minute);
+                lv2_atom_forge_key(&forge, g_urids.time_beatsPerMinute);
+                lv2_atom_forge_float(&forge, pos.beats_per_minute);
 
-                lv2_atom_forge_key(forge, g_urids.time_ticksPerBeat);
-                lv2_atom_forge_double(forge, pos.ticks_per_beat);
+                lv2_atom_forge_key(&forge, g_urids.time_ticksPerBeat);
+                lv2_atom_forge_double(&forge, pos.ticks_per_beat);
             }
 
-            lv2_atom_forge_pop(forge, &frame);
+            lv2_atom_forge_pop(&forge, &frame);
         }
     }
     if (effect->bpm_index >= 0)
     {
-        *(effect->ports[effect->bpm_index]->buffer) = g_jack_pos.beats_per_minute;
+        *(effect->ports[effect->bpm_index]->buffer) = g_transport_bpm;
     }
     if (effect->speed_index >= 0)
     {
@@ -1192,19 +1196,19 @@ static void UpdateGlobalJackPosition(bool report_changes)
     if (report_changes)
     {
         old_rolling = g_jack_rolling;
-        old_bpm = g_jack_pos.beats_per_minute;
+        old_bpm = g_transport_bpm;
     }
 
     g_jack_rolling = (jack_transport_query(g_jack_global_client, &g_jack_pos) == JackTransportRolling);
 
     if ((g_jack_pos.valid & JackPositionBBT) == 0)
     {
-        g_jack_pos.beats_per_minute = 120.0;
+        g_jack_pos.beats_per_minute = g_transport_bpm;
     }
 
     if (!report_changes)
         return;
-    if (old_rolling == g_jack_rolling && old_bpm == g_jack_pos.beats_per_minute)
+    if (old_rolling == g_jack_rolling && old_bpm == g_transport_bpm)
         return;
 
     postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
@@ -1214,7 +1218,7 @@ static void UpdateGlobalJackPosition(bool report_changes)
 
     posteventptr->event.type = POSTPONED_TRANSPORT;
     posteventptr->event.transport.rolling = g_jack_rolling;
-    posteventptr->event.transport.bpm     = g_jack_pos.beats_per_minute;
+    posteventptr->event.transport.bpm     = g_transport_bpm;
 
     pthread_mutex_lock(&g_rtsafe_mutex);
     list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -1361,6 +1365,52 @@ static int ProcessMidi(jack_nframes_t nframes, void *arg)
 
     return 0;
 
+    UNUSED_PARAM(arg);
+}
+
+static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
+                         jack_position_t *pos, int new_pos, void *arg)
+{
+    if (new_pos || g_transport_reset)
+    {
+        pos->valid = JackPositionBBT;
+        pos->beats_per_bar = 4.0f;
+        pos->beat_type = 4.0f;
+        pos->ticks_per_beat = 1920.0f;
+        pos->beats_per_minute = g_transport_bpm;
+
+        g_transport_reset = false;
+
+        const double min      = pos->frame / ((double) pos->frame_rate * 60.0);
+        const long   abs_tick = min * pos->beats_per_minute * pos->ticks_per_beat;
+        const long   abs_beat = abs_tick / pos->ticks_per_beat;
+
+        pos->bar  = abs_beat / pos->beats_per_bar;
+        pos->beat = abs_beat - (pos->bar * pos->beats_per_bar) + 1;
+        pos->tick = abs_tick - (abs_beat * pos->ticks_per_beat);
+        pos->bar_start_tick = pos->bar * pos->beats_per_bar * pos->ticks_per_beat;
+        pos->bar++;
+    }
+    else
+    {
+        pos->tick += nframes * pos->ticks_per_beat * pos->beats_per_minute / (pos->frame_rate * 60);
+
+        while (pos->tick >= pos->ticks_per_beat)
+        {
+            pos->tick -= pos->ticks_per_beat;
+
+            if (++pos->beat > pos->beats_per_bar)
+            {
+                pos->beat = 1;
+                ++pos->bar;
+                pos->bar_start_tick += pos->beats_per_bar * pos->ticks_per_beat;
+            }
+        }
+    }
+
+    return;
+
+    UNUSED_PARAM(state);
     UNUSED_PARAM(arg);
 }
 
@@ -1711,8 +1761,13 @@ int effects_init(void* client)
     g_block_length = jack_get_buffer_size(g_jack_global_client);
     g_midi_buffer_size = jack_port_type_get_buffer_size(g_jack_global_client, JACK_DEFAULT_MIDI_TYPE);
 
+    /* initial transport state */
+    g_transport_reset = true;
+    g_transport_bpm = 120.0;
+
     /* Set jack callbacks */
     jack_set_thread_init_callback(g_jack_global_client, JackThreadInit, NULL);
+    jack_set_timebase_callback(g_jack_global_client, 1, JackTimebase, NULL);
     jack_set_process_callback(g_jack_global_client, ProcessMidi, NULL);
 
     /* Register jack ports */
@@ -2377,7 +2432,7 @@ int effects_add(const char *uid, int instance)
     if (bpm_port)
     {
         effect->bpm_index = lilv_port_get_index(plugin, bpm_port);
-        *(effect->ports[effect->bpm_index]->buffer) = g_jack_pos.beats_per_minute;
+        *(effect->ports[effect->bpm_index]->buffer) = g_transport_bpm;
     }
     else
     {
@@ -2668,7 +2723,7 @@ int effects_preset_load(int effect_id, const char *uri)
             }
             if (effect->bpm_index >= 0)
             {
-                *(effect->ports[effect->bpm_index]->buffer) = g_jack_pos.beats_per_minute;
+                *(effect->ports[effect->bpm_index]->buffer) = g_transport_bpm;
             }
             if (effect->speed_index >= 0)
             {
