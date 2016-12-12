@@ -135,6 +135,7 @@ void effects_midi_program_listen(int enable, int channel);
 float effects_jack_cpu_load(void);
 void effects_bundle_add(const char* bundlepath);
 void effects_bundle_remove(const char* bundlepath);
+void effects_transport(int rolling, double bpm);
 void effects_output_data_ready(void);
 
 /*

@@ -331,10 +331,7 @@ static void midi_unmap_cb(proto_t *proto)
 static void midi_program_listen_cb(proto_t *proto)
 {
     effects_midi_program_listen(atoi(proto->list[1]), atoi(proto->list[2]));
-
-    char buffer[128];
-    sprintf(buffer, "resp 0");
-    protocol_response(buffer, proto);
+    protocol_response("resp 0", proto);
 }
 
 static void cpu_load_cb(proto_t *proto)
@@ -405,6 +402,12 @@ static void bundle_add(proto_t *proto)
 static void bundle_remove(proto_t *proto)
 {
     effects_bundle_remove(proto->list[1]);
+    protocol_response("resp 0", proto);
+}
+
+static void transport(proto_t *proto)
+{
+    effects_transport(atoi(proto->list[1]), atof(proto->list[2]));
     protocol_response("resp 0", proto);
 }
 
@@ -514,6 +517,7 @@ static int mod_host_init(jack_client_t* client, int socket_port)
     protocol_add_command(SAVE_COMMANDS, save_cb);
     protocol_add_command(BUNDLE_ADD, bundle_add);
     protocol_add_command(BUNDLE_REMOVE, bundle_remove);
+    protocol_add_command(TRANSPORT, transport);
     protocol_add_command(OUTPUT_DATA_READY, output_data_ready);
 
     /* skip help and quit for internal client */

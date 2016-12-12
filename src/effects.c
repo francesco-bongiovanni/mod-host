@@ -3568,6 +3568,24 @@ void effects_bundle_remove(const char* bpath)
 #endif
 }
 
+void effects_transport(int rolling, double bpm)
+{
+    if (g_transport_bpm != bpm)
+    {
+        g_transport_bpm = bpm;
+        g_transport_reset = true;
+    }
+
+    if (g_jack_rolling != (rolling != 0))
+    {
+        if (rolling)
+            jack_transport_start(g_jack_global_client);
+        else
+            jack_transport_stop(g_jack_global_client);
+        // g_jack_rolling is updated on the next jack callback
+    }
+}
+
 void effects_output_data_ready(void)
 {
     if (! g_postevents_ready)
