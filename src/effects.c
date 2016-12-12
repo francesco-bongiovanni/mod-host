@@ -1203,7 +1203,8 @@ static void UpdateGlobalJackPosition(bool report_changes)
 
     if (g_jack_pos.valid & JackPositionBBT)
     {
-        g_transport_bpm = g_jack_pos.beats_per_minute;
+        if (!g_transport_reset)
+            g_transport_bpm = g_jack_pos.beats_per_minute;
     }
     else
     {
