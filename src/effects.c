@@ -416,6 +416,7 @@ static jack_port_t *g_midi_in_port;
 static jack_position_t g_jack_pos;
 static bool g_jack_rolling;
 static volatile double g_transport_bpm;
+static double g_transport_tick;
 static volatile bool g_transport_reset;
 
 /* LV2 and Lilv */
@@ -1407,14 +1408,16 @@ static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
         pos->tick = abs_tick - (abs_beat * pos->ticks_per_beat);
         pos->bar_start_tick = pos->bar * pos->beats_per_bar * pos->ticks_per_beat;
         pos->bar++;
+
+        g_transport_tick = pos->tick;
     }
     else
     {
-        pos->tick += nframes * pos->ticks_per_beat * pos->beats_per_minute / (pos->frame_rate * 60);
+        g_transport_tick += nframes * pos->ticks_per_beat * pos->beats_per_minute / (pos->frame_rate * 60);
 
-        while (pos->tick >= pos->ticks_per_beat)
+        while (g_transport_tick >= pos->ticks_per_beat)
         {
-            pos->tick -= pos->ticks_per_beat;
+            g_transport_tick -= pos->ticks_per_beat;
 
             if (++pos->beat > pos->beats_per_bar)
             {
@@ -1423,6 +1426,8 @@ static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
                 pos->bar_start_tick += pos->beats_per_bar * pos->ticks_per_beat;
             }
         }
+
+        pos->tick = (int)(g_transport_tick + 0.5);
     }
 
     return;
