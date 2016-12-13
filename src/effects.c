@@ -768,8 +768,13 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
 
     if (effect->hints & HINT_TRANSPORT)
     {
-        const bool rolling = g_jack_rolling;
-        const jack_position_t pos = g_jack_pos;
+        jack_position_t pos;
+        const bool rolling = (jack_transport_query(effect->jack_client, &pos) == JackTransportRolling);
+
+        if ((pos.valid & JackPositionBBT) == 0)
+        {
+            pos.beats_per_minute = g_transport_bpm;
+        }
 
         if (effect->transport_rolling != rolling ||
             effect->transport_frame != pos.frame ||
@@ -817,6 +822,10 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
             }
 
             lv2_atom_forge_pop(&forge, &frame);
+        }
+        else
+        {
+            lv2_pos->size = 0;
         }
     }
     if (effect->bpm_index >= 0)
@@ -882,7 +891,10 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
             }
 
             /* Write time position */
-            lv2_evbuf_write(&iter, 0, 0, lv2_pos->type, lv2_pos->size, LV2_ATOM_BODY_CONST(lv2_pos));
+            if (lv2_pos->size > 0 && (effect->input_event_ports[i]->hints & HINT_TRANSPORT) != 0)
+            {
+                lv2_evbuf_write(&iter, 0, 0, lv2_pos->type, lv2_pos->size, LV2_ATOM_BODY_CONST(lv2_pos));
+            }
         }
     }
 
