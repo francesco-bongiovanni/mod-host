@@ -1405,11 +1405,9 @@ static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
 
         pos->bar  = abs_beat / pos->beats_per_bar;
         pos->beat = abs_beat - (pos->bar * pos->beats_per_bar) + 1;
-        pos->tick = abs_tick - (abs_beat * pos->ticks_per_beat);
+        g_transport_tick = abs_tick - (abs_beat * pos->ticks_per_beat);
         pos->bar_start_tick = pos->bar * pos->beats_per_bar * pos->ticks_per_beat;
         pos->bar++;
-
-        g_transport_tick = pos->tick;
     }
     else
     {
@@ -1426,9 +1424,9 @@ static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
                 pos->bar_start_tick += pos->beats_per_bar * pos->ticks_per_beat;
             }
         }
-
-        pos->tick = (int)(g_transport_tick + 0.5);
     }
+
+    pos->tick = (int)(g_transport_tick + 0.5);
 
     return;
 
