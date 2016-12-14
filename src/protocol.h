@@ -48,7 +48,7 @@
 ************************************************************************************************************************
 */
 
-#define PROTOCOL_MAX_COMMANDS       28
+#define PROTOCOL_MAX_COMMANDS       29
 
 // error messages configuration
 #define MESSAGE_COMMAND_NOT_FOUND   "not found"

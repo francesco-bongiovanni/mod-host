@@ -79,6 +79,11 @@ link_t* link_create(double bpm, uint32_t buffer_size, uint32_t sample_rate)
     return (link_t*)t;
 }
 
+void link_enable(link_t* link, bool on)
+{
+    ((LinkTransport*)link)->setEnabled(on);
+}
+
 void link_set_tempo(link_t* link, double bpm)
 {
     ((LinkTransport*)link)->setTempo(bpm);

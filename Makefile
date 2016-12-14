@@ -75,7 +75,7 @@ $(PROG).so: $(OBJ)
 	$(CC) $(INCS) $(CFLAGS) -o $@ $<
 
 # custom rule for src/link/mod-link.o
-src/link/mod-link.o: src/link/mod-link.cpp
+src/link/mod-link.o: src/link/mod-link.cpp src/link/mod-link.h
 	$(CXX) $(INCS) -Isrc/link -DLINK_PLATFORM_UNIX=1 -DLINK_PLATFORM_LINUX=1 $(CXXFLAGS) -o $@ $<
 
 # custom rules for monitor client

@@ -449,6 +449,7 @@ static LV2_Feature g_buf_size_features[3] = {
 static int g_midi_program_listen;
 static pthread_mutex_t g_midi_learning_mutex;
 
+static bool link_enabled;
 static link_t* g_link_instance;
 static link_time_info_t g_link_info;
 
@@ -1255,20 +1256,21 @@ static int ProcessMidi(jack_nframes_t nframes, void *arg)
     int8_t channel, controller;
     float value;
     bool handled, needs_post = false;
+    int pos_flag = 1;
 
-    link_process(g_link_instance, nframes, &g_link_info);
-    double new_bpm = g_link_info.bpm;
+    if (link_enabled)
+    {
+        link_process(g_link_instance, nframes, &g_link_info);
+        const double new_bpm = g_link_info.bpm;
 
-    if (g_transport_bpm != new_bpm)
-    {
-        g_transport_reset = true;
-        g_transport_bpm = new_bpm;
-        UpdateGlobalJackPosition(2);
+        if (g_transport_bpm != new_bpm)
+        {
+            g_transport_reset = true;
+            g_transport_bpm = new_bpm;
+            pos_flag = 2;
+        }
     }
-    else
-    {
-        UpdateGlobalJackPosition(1);
-    }
+    UpdateGlobalJackPosition(pos_flag);
 
     void *const port_buf = jack_port_get_buffer(g_midi_in_port, nframes);
     const jack_nframes_t event_count = jack_midi_get_event_count(port_buf);
@@ -1417,7 +1419,7 @@ static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
 
         double abs_beat, abs_tick;
 
-        if (g_link_info.bpm > 0.0)
+        if (link_enabled && g_link_info.bpm > 0.0)
         {
             abs_beat = floor(g_link_info.beats);
             abs_tick = g_link_info.beats * pos->ticks_per_beat;
@@ -1818,6 +1820,7 @@ int effects_init(void* client)
     jack_set_process_callback(g_jack_global_client, ProcessMidi, NULL);
 
     /* Init link */
+    link_enabled = false;
     memset(&g_link_info, 0, sizeof(g_link_info));
     g_link_instance = link_create(g_transport_bpm, g_block_length, g_sample_rate);
 
@@ -3619,6 +3622,12 @@ void effects_bundle_remove(const char* bpath)
 #endif
 }
 
+void effects_link_enable(int enable)
+{
+    link_enabled = enable != 0;
+    link_enable(g_link_instance, enable != 0);
+}
+
 void effects_transport(int rolling, double bpm)
 {
     if ((g_jack_pos.valid & JackPositionBBT) == 0)
@@ -3626,14 +3635,16 @@ void effects_transport(int rolling, double bpm)
         // old timebase master no longer active, make ourselves master again
         g_transport_bpm = bpm;
         g_transport_reset = true;
-        link_set_tempo(g_link_instance, bpm);
         jack_set_timebase_callback(g_jack_global_client, 1, JackTimebase, NULL);
+
+        if (link_enabled) link_set_tempo(g_link_instance, bpm);
     }
     else if (g_transport_bpm != bpm)
     {
         g_transport_bpm = bpm;
         g_transport_reset = true;
-        link_set_tempo(g_link_instance, bpm);
+
+        if (link_enabled) link_set_tempo(g_link_instance, bpm);
     }
 
     if (g_jack_rolling != (rolling != 0))
