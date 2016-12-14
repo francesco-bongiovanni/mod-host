@@ -90,6 +90,7 @@
 #include "lv2_evbuf.h"
 #include "worker.h"
 #include "symap.h"
+#include "link/mod-link.h"
 #include "sha1/sha1.h"
 #include "rtmempool/list.h"
 #include "rtmempool/rtmempool.h"
@@ -448,6 +449,9 @@ static LV2_Feature g_buf_size_features[3] = {
 static int g_midi_program_listen;
 static pthread_mutex_t g_midi_learning_mutex;
 
+static link_t* g_link_instance;
+static link_time_info_t g_link_info;
+
 static const char* const g_bypass_port_symbol = BYPASS_PORT_SYMBOL;
 
 
@@ -466,7 +470,7 @@ static void RunPostPonedEvents(int ignored_effect_id);
 static void* PostPonedEventsThread(void* arg);
 static int ProcessPlugin(jack_nframes_t nframes, void *arg);
 static float UpdateValueFromMidi(midi_cc_t* mcc, jack_midi_data_t mvalue);
-static void UpdateGlobalJackPosition(bool report_changes);
+static void UpdateGlobalJackPosition(int report_changes);
 static int ProcessMidi(jack_nframes_t nframes, void *arg);
 static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
                          jack_position_t* pos, int new_pos, void* arg);
@@ -1201,7 +1205,7 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, jack_midi_data_t mvalue)
     }
 }
 
-static void UpdateGlobalJackPosition(bool report_changes)
+static void UpdateGlobalJackPosition(int report_changes)
 {
     bool old_rolling;
     double old_bpm;
@@ -1226,7 +1230,7 @@ static void UpdateGlobalJackPosition(bool report_changes)
 
     if (!report_changes)
         return;
-    if (old_rolling == g_jack_rolling && old_bpm == g_transport_bpm)
+    if (old_rolling == g_jack_rolling && old_bpm == g_transport_bpm && report_changes <= 1)
         return;
 
     postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
@@ -1252,7 +1256,19 @@ static int ProcessMidi(jack_nframes_t nframes, void *arg)
     float value;
     bool handled, needs_post = false;
 
-    UpdateGlobalJackPosition(true);
+    link_process(g_link_instance, nframes, &g_link_info);
+    double new_bpm = g_link_info.bpm;
+
+    if (g_transport_bpm != new_bpm)
+    {
+        g_transport_reset = true;
+        g_transport_bpm = new_bpm;
+        UpdateGlobalJackPosition(2);
+    }
+    else
+    {
+        UpdateGlobalJackPosition(1);
+    }
 
     void *const port_buf = jack_port_get_buffer(g_midi_in_port, nframes);
     const jack_nframes_t event_count = jack_midi_get_event_count(port_buf);
@@ -1399,9 +1415,19 @@ static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
 
         g_transport_reset = false;
 
-        const double min      = pos->frame / ((double) pos->frame_rate * 60.0);
-        const long   abs_tick = min * pos->beats_per_minute * pos->ticks_per_beat;
-        const long   abs_beat = abs_tick / pos->ticks_per_beat;
+        double abs_beat, abs_tick;
+
+        if (g_link_info.bpm > 0.0)
+        {
+            abs_beat = floor(g_link_info.beats);
+            abs_tick = g_link_info.beats * pos->ticks_per_beat;
+        }
+        else
+        {
+            double min = pos->frame / ((double) pos->frame_rate * 60.0);
+            abs_tick   = min * pos->beats_per_minute * pos->ticks_per_beat;
+            abs_beat   = abs_tick / pos->ticks_per_beat;
+        }
 
         pos->bar  = abs_beat / pos->beats_per_bar;
         pos->beat = abs_beat - (pos->bar * pos->beats_per_bar) + 1;
@@ -1779,6 +1805,7 @@ int effects_init(void* client)
 
     /* Get buffers size */
     g_block_length = jack_get_buffer_size(g_jack_global_client);
+    g_sample_rate = jack_get_sample_rate(g_jack_global_client);
     g_midi_buffer_size = jack_port_type_get_buffer_size(g_jack_global_client, JACK_DEFAULT_MIDI_TYPE);
 
     /* initial transport state */
@@ -1789,6 +1816,10 @@ int effects_init(void* client)
     jack_set_thread_init_callback(g_jack_global_client, JackThreadInit, NULL);
     jack_set_timebase_callback(g_jack_global_client, 1, JackTimebase, NULL);
     jack_set_process_callback(g_jack_global_client, ProcessMidi, NULL);
+
+    /* Init link */
+    memset(&g_link_info, 0, sizeof(g_link_info));
+    g_link_instance = link_create(g_transport_bpm, g_block_length, g_sample_rate);
 
     /* Register jack ports */
     g_midi_in_port = jack_port_register(g_jack_global_client, "midi_in", JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
@@ -1811,7 +1842,7 @@ int effects_init(void* client)
     }
 
     /* get transport state */
-    UpdateGlobalJackPosition(false);
+    UpdateGlobalJackPosition(0);
 
     /* Connect to all good hw ports (system, ttymidi and nooice) */
     const char** const midihwports = jack_get_ports(g_jack_global_client, "", JACK_DEFAULT_MIDI_TYPE,
@@ -1845,7 +1876,6 @@ int effects_init(void* client)
     g_plugins = lilv_world_get_all_plugins(g_lv2_data);
 
     /* Get sample rate */
-    g_sample_rate = jack_get_sample_rate(g_jack_global_client);
     g_sample_rate_node = lilv_new_uri(g_lv2_data, LV2_CORE__sampleRate);
 
     /* URI and URID Feature initialization */
@@ -1977,6 +2007,7 @@ int effects_finish(int close_client)
     sem_destroy(&g_postevents_semaphore);
     pthread_mutex_destroy(&g_rtsafe_mutex);
     pthread_mutex_destroy(&g_midi_learning_mutex);
+    link_cleanup(g_link_instance);
 
     return SUCCESS;
 }
@@ -3595,12 +3626,14 @@ void effects_transport(int rolling, double bpm)
         // old timebase master no longer active, make ourselves master again
         g_transport_bpm = bpm;
         g_transport_reset = true;
+        link_set_tempo(g_link_instance, bpm);
         jack_set_timebase_callback(g_jack_global_client, 1, JackTimebase, NULL);
     }
     else if (g_transport_bpm != bpm)
     {
         g_transport_bpm = bpm;
         g_transport_reset = true;
+        link_set_tempo(g_link_instance, bpm);
     }
 
     if (g_jack_rolling != (rolling != 0))

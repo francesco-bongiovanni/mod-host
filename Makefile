@@ -1,5 +1,6 @@
 # compiler
 CC ?= gcc
+CXX ?= g++
 
 # language file extension
 EXT = c
@@ -18,14 +19,18 @@ MANDIR = $(SHAREDIR)/man/man1/
 
 # default compiler and linker flags
 CFLAGS += -O3 -Wall -Wextra -c -std=gnu99 -fPIC -D_GNU_SOURCE
-LDFLAGS += -Wl,--no-undefined
+CXXFLAGS += -O3 -Wall -Wextra -c -std=c++11 -fPIC -D_GNU_SOURCE
+CXXFLAGS += -Wno-multichar -Wno-unused-variable -Wno-uninitialized -Wno-missing-field-initializers
+LDFLAGS += -Wl,--no-undefined -lstdc++
 
 # debug mode compiler and linker flags
 ifeq ($(DEBUG), 1)
-   CFLAGS += -O0 -g -Wall -Wextra -c -DDEBUG -std=gnu99
+   CFLAGS += -O0 -g -Wall -Wextra -c -DDEBUG
+   CXXFLAGS += -O0 -g -Wall -Wextra -c -DDEBUG
    LDFLAGS +=
 else
    CFLAGS += -fvisibility=hidden
+   CXXFLAGS += -fvisibility=hidden
    LDFLAGS += -s
 endif
 
@@ -53,7 +58,7 @@ endif
 
 # source and object files
 SRC = $(wildcard $(SRC_DIR)/*.$(EXT)) $(SRC_DIR)/sha1/sha1.c $(SRC_DIR)/rtmempool/rtmempool.c
-OBJ = $(SRC:.$(EXT)=.o)
+OBJ = $(SRC:.$(EXT)=.o) src/link/mod-link.o
 
 # default build
 all: $(PROG) $(PROG).so mod-monitor.so
@@ -68,6 +73,10 @@ $(PROG).so: $(OBJ)
 # meta-rule to generate the object files
 %.o: %.$(EXT) src/info.h
 	$(CC) $(INCS) $(CFLAGS) -o $@ $<
+
+# custom rule for src/link/mod-link.o
+src/link/mod-link.o: src/link/mod-link.cpp
+	$(CXX) $(INCS) -Isrc/link -DLINK_PLATFORM_UNIX=1 -DLINK_PLATFORM_LINUX=1 $(CXXFLAGS) -o $@ $<
 
 # custom rules for monitor client
 mod-monitor.so: src/mod-monitor.o
