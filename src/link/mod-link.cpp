@@ -28,16 +28,25 @@ public:
         : link(bpm),
           engine(link),
           outputLatency(0),
-          sampleTime(0)
+          sampleTime(0),
+          forcedTempo(0)
     {
         outputLatency = std::chrono::microseconds(llround(1.0e6 * bufferSize / sampleRate));
-
-        // testing
-        setEnabled(true);
     }
 
-    void setEnabled(bool enabled)
+    void setEnabled(bool enabled, double bpm)
     {
+        if (enabled)
+        {
+            sampleTime = 0;
+
+            if (link.numPeers() == 0)
+            {
+                forcedTempo = bpm;
+                engine.setTempo(bpm);
+            }
+        }
+
         link.enable(enabled);
     }
 
@@ -48,13 +57,21 @@ public:
 
     void process(uint32_t frames, LinkTimeInfo* info)
     {
+        if (forcedTempo > 0 && sampleTime == 0)
+            engine.setTempo(forcedTempo);
+
         const auto hostTime = hostTimeFilter.sampleTimeToHostTime(sampleTime);
-
-        sampleTime += frames;
-
         const auto bufferBeginAtOutput = hostTime + outputLatency;
 
         engine.audioCallback(bufferBeginAtOutput, info);
+
+        if (forcedTempo > 0 && sampleTime == 0)
+        {
+            info->bpm = forcedTempo;
+            forcedTempo = 0;
+        }
+
+        sampleTime += frames;
     }
 
 private:
@@ -64,6 +81,7 @@ private:
     ableton::link::HostTimeFilter<ableton::platforms::stl::Clock> hostTimeFilter;
     std::chrono::microseconds outputLatency;
     double sampleTime;
+    double forcedTempo;
 };
 
 link_t* link_create(double bpm, uint32_t buffer_size, uint32_t sample_rate)
@@ -79,9 +97,9 @@ link_t* link_create(double bpm, uint32_t buffer_size, uint32_t sample_rate)
     return (link_t*)t;
 }
 
-void link_enable(link_t* link, bool on)
+void link_enable(link_t* link, bool on, double bpm)
 {
-    ((LinkTransport*)link)->setEnabled(on);
+    ((LinkTransport*)link)->setEnabled(on, bpm);
 }
 
 void link_set_tempo(link_t* link, double bpm)

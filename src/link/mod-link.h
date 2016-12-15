@@ -34,7 +34,7 @@ typedef struct LINK_TIME_INFO_T {
 } link_time_info_t;
 
 link_t* link_create(double bpm, uint32_t buffer_size, uint32_t sample_rate);
-void link_enable(link_t* link, bool on);
+void link_enable(link_t* link, bool on, double bpm);
 void link_process(link_t* link, uint32_t frames, link_time_info_t* info);
 void link_set_tempo(link_t* link, double tempo);
 void link_cleanup(link_t* link);

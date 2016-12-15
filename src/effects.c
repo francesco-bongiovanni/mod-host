@@ -1263,11 +1263,15 @@ static int ProcessMidi(jack_nframes_t nframes, void *arg)
         link_process(g_link_instance, nframes, &g_link_info);
         const double new_bpm = g_link_info.bpm;
 
-        if (g_transport_bpm != new_bpm)
+        if (new_bpm > 0.0 && g_transport_bpm != new_bpm)
         {
-            g_transport_reset = true;
+            // advance timebase to next process callback
             g_transport_bpm = new_bpm;
+            JackTimebase(g_jack_rolling ? JackTransportRolling : JackTransportStopped, nframes, &g_jack_pos, 0, NULL);
+
+            // force sending changes to UI
             pos_flag = 2;
+            g_transport_reset = true;
         }
     }
     UpdateGlobalJackPosition(pos_flag);
@@ -1421,14 +1425,21 @@ static void JackTimebase(jack_transport_state_t state, jack_nframes_t nframes,
 
         if (link_enabled && g_link_info.bpm > 0.0)
         {
-            abs_beat = floor(g_link_info.beats);
-            abs_tick = g_link_info.beats * pos->ticks_per_beat;
+            const double beats = g_link_info.beats;
+
+            if (beats < 0.0)
+            {
+                printf("FIXME!! %f\n", beats);
+            }
+
+            abs_beat = floor(beats);
+            abs_tick = beats * pos->ticks_per_beat;
         }
         else
         {
-            double min = pos->frame / ((double) pos->frame_rate * 60.0);
-            abs_tick   = min * pos->beats_per_minute * pos->ticks_per_beat;
-            abs_beat   = abs_tick / pos->ticks_per_beat;
+            const double min = pos->frame / ((double) pos->frame_rate * 60.0);
+            abs_tick = min * pos->beats_per_minute * pos->ticks_per_beat;
+            abs_beat = abs_tick / pos->ticks_per_beat;
         }
 
         pos->bar  = abs_beat / pos->beats_per_bar;
@@ -1835,44 +1846,6 @@ int effects_init(void* client)
         return ERR_JACK_PORT_REGISTER;
     }
 
-    /* Try activate the jack global client */
-    if (jack_activate(g_jack_global_client) != 0)
-    {
-        fprintf(stderr, "can't activate global jack client\n");
-        if (client == NULL)
-            jack_client_close(g_jack_global_client);
-        return ERR_JACK_CLIENT_ACTIVATION;
-    }
-
-    /* get transport state */
-    UpdateGlobalJackPosition(0);
-
-    /* Connect to all good hw ports (system, ttymidi and nooice) */
-    const char** const midihwports = jack_get_ports(g_jack_global_client, "", JACK_DEFAULT_MIDI_TYPE,
-                                                                              JackPortIsOutput|JackPortIsPhysical);
-    if (midihwports != NULL)
-    {
-        char ourportname[MAX_CHAR_BUF_SIZE+1];
-        ourportname[MAX_CHAR_BUF_SIZE] = '\0';
-
-        const char* const ourclientname = jack_get_client_name(g_jack_global_client);
-
-        snprintf(ourportname, MAX_CHAR_BUF_SIZE, "%s:midi_in", ourclientname);
-
-        for (int i=0; midihwports[i] != NULL; ++i)
-        {
-            const char* const portname = midihwports[i];
-            if (strncmp(portname, "ttymidi:", 8) != 0 &&
-                strncmp(portname, "system:", 7) != 0 &&
-                strncmp(portname, "nooice", 5) != 0)
-                continue;
-
-            jack_connect(g_jack_global_client, portname, ourportname);
-        }
-
-        jack_free(midihwports);
-    }
-
     /* Load all LV2 data */
     g_lv2_data = lilv_world_new();
     lilv_world_load_all(g_lv2_data);
@@ -1989,6 +1962,44 @@ int effects_init(void* client)
     g_postevents_running = 1;
     g_postevents_ready = true;
     pthread_create(&g_postevents_thread, NULL, PostPonedEventsThread, NULL);
+
+    /* get transport state */
+    UpdateGlobalJackPosition(0);
+
+    /* Try activate the jack global client */
+    if (jack_activate(g_jack_global_client) != 0)
+    {
+        fprintf(stderr, "can't activate global jack client\n");
+        if (client == NULL)
+            jack_client_close(g_jack_global_client);
+        return ERR_JACK_CLIENT_ACTIVATION;
+    }
+
+    /* Connect to all good hw ports (system, ttymidi and nooice) */
+    const char** const midihwports = jack_get_ports(g_jack_global_client, "", JACK_DEFAULT_MIDI_TYPE,
+                                                                              JackPortIsOutput|JackPortIsPhysical);
+    if (midihwports != NULL)
+    {
+        char ourportname[MAX_CHAR_BUF_SIZE+1];
+        ourportname[MAX_CHAR_BUF_SIZE] = '\0';
+
+        const char* const ourclientname = jack_get_client_name(g_jack_global_client);
+
+        snprintf(ourportname, MAX_CHAR_BUF_SIZE, "%s:midi_in", ourclientname);
+
+        for (int i=0; midihwports[i] != NULL; ++i)
+        {
+            const char* const portname = midihwports[i];
+            if (strncmp(portname, "ttymidi:", 8) != 0 &&
+                strncmp(portname, "system:", 7) != 0 &&
+                strncmp(portname, "nooice", 5) != 0)
+                continue;
+
+            jack_connect(g_jack_global_client, portname, ourportname);
+        }
+
+        jack_free(midihwports);
+    }
 
     return SUCCESS;
 }
@@ -3625,7 +3636,7 @@ void effects_bundle_remove(const char* bpath)
 void effects_link_enable(int enable)
 {
     link_enabled = enable != 0;
-    link_enable(g_link_instance, enable != 0);
+    link_enable(g_link_instance, enable != 0, g_transport_bpm);
 }
 
 void effects_transport(int rolling, double bpm)
