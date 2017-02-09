@@ -42,7 +42,7 @@ public:
   double quantum() const;
   void setQuantum(double quantum);
 
-  void audioCallback(const std::chrono::microseconds hostTime, LinkTimeInfo* const info);
+  void timelineCallback(const std::chrono::microseconds hostTime, LinkTimeInfo* const info);
 
 private:
   struct EngineData

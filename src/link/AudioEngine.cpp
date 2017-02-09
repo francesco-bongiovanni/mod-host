@@ -75,7 +75,7 @@ AudioEngine::EngineData AudioEngine::pullEngineData()
   return engineData;
 }
 
-void AudioEngine::audioCallback(const std::chrono::microseconds hostTime, LinkTimeInfo* const info)
+void AudioEngine::timelineCallback(const std::chrono::microseconds hostTime, LinkTimeInfo* const info)
 {
   const auto engineData = pullEngineData();
 
