@@ -65,6 +65,12 @@ LIBS += -lNE10
 INCS += -DHAVE_NE10
 endif
 
+# control chain support
+ifeq ($(shell pkg-config --exists cc_client && echo true), true)
+LIBS += $(shell pkg-config --libs cc_client)
+INCS += $(shell pkg-config --cflags cc_client) -DHAVE_CONTROLCHAIN
+endif
+
 # source and object files
 SRC = $(wildcard $(SRC_DIR)/*.$(EXT)) $(SRC_DIR)/sha1/sha1.c $(SRC_DIR)/rtmempool/rtmempool.c
 OBJ = $(SRC:.$(EXT)=.o) src/link/mod-link.o

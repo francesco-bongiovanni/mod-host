@@ -56,6 +56,11 @@
 #include <lv2/lv2plug.in/ns/ext/parameters/parameters.h>
 #include "mod-license.h"
 
+#ifdef HAVE_CONTROLCHAIN
+/* Control Chain */
+#include <cc/cc_client.h>
+#endif
+
 #ifndef HAVE_NEW_LILV
 #define lilv_free(x) free(x)
 #warning Your current lilv version does not support loading or unloading bundles
@@ -106,8 +111,8 @@
 
 #define REMOVE_ALL      (-1)
 
-#define MIDI_LEARN_UNUSED -1
-#define MIDI_LEARN_NULL   -2
+#define ASSIGNMENT_UNUSED -1 // item was used before, so there might other valid items after this one
+#define ASSIGNMENT_NULL   -2 // item never used before, thus signaling the end of valid items
 
 #define BYPASS_PORT_SYMBOL  ":bypass"
 #define PRESETS_PORT_SYMBOL ":presets"
@@ -205,7 +210,6 @@ typedef struct PROPERTY_T {
 typedef struct PROPERTY_EVENT_T {
     uint32_t size;
     uint8_t  body[];
-
 } property_event_t;
 
 typedef struct PRESET_T {
@@ -279,7 +283,8 @@ typedef struct EFFECT_T {
     jack_ringbuffer_t *events_buffer;
 
     // current and previous bypass state
-    bool bypass;
+    port_t bypass_port;
+    float bypass;
     bool was_bypassed;
 
     // cached plugin information, avoids itenerating controls each cycle
@@ -289,6 +294,10 @@ typedef struct EFFECT_T {
     bool transport_rolling;
     uint32_t transport_frame;
     double transport_bpm;
+
+    // virtual presets port
+    port_t presets_port;
+    float preset_value;
 } effect_t;
 
 typedef struct URIDS_T {
@@ -401,6 +410,12 @@ typedef struct POSTPONED_CACHED_EVENTS {
 static effect_t g_effects[MAX_INSTANCES];
 static midi_cc_t g_midi_cc_list[MAX_MIDI_CC_ASSIGN], *g_midi_learning;
 
+#ifdef HAVE_CONTROLCHAIN
+/* Control Chain */
+static cc_client_t *g_cc_client = NULL;
+static assignment_t g_assignments_list[CC_MAX_DEVICES][CC_MAX_ASSIGNMENTS];
+#endif
+
 static struct list_head g_rtsafe_list;
 static RtMemPool_Handle g_rtsafe_mem_pool;
 static pthread_mutex_t  g_rtsafe_mutex;
@@ -456,6 +471,7 @@ static link_t* g_link_instance;
 static link_time_info_t g_link_info;
 
 static const char* const g_bypass_port_symbol = BYPASS_PORT_SYMBOL;
+static const char* const g_presets_port_symbol = PRESETS_PORT_SYMBOL;
 
 
 /*
@@ -487,6 +503,10 @@ static int LoadPresets(effect_t *effect);
 static void FreeFeatures(effect_t *effect);
 static char* GetLicenseFile(MOD_License_Handle handle, const char *license_uri);
 static void FreeLicenseData(MOD_License_Handle handle, char *license);
+#ifdef HAVE_CONTROLCHAIN
+static void CCDataUpdate(void* arg);
+static void InitializeControlChainIfNeeded(void);
+#endif
 
 
 /*
@@ -600,7 +620,7 @@ static bool ShouldIgnorePostPonedEvent(postponed_parameter_event_t* ev, postpone
     return false;
 }
 
-void RunPostPonedEvents(int ignored_effect_id)
+static void RunPostPonedEvents(int ignored_effect_id)
 {
     // local queue to where we'll save rtsafe list
     struct list_head queue;
@@ -849,7 +869,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     {
         lv2_evbuf_reset(effect->input_event_ports[i]->evbuf, true);
 
-        if (effect->bypass)
+        if (effect->bypass > 0.5f)
         {
             // effect is now bypassed, but wasn't before
             if (!effect->was_bypassed)
@@ -930,7 +950,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     }
 
     /* Bypass */
-    if (effect->bypass && effect->enabled_index < 0)
+    if (effect->bypass > 0.5f && effect->enabled_index < 0)
     {
         /* Plugins with audio inputs */
         if (effect->input_audio_ports_count > 0)
@@ -1058,7 +1078,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
             void* buf = jack_port_get_buffer(port->jack_port, nframes);
             jack_midi_clear_buffer(buf);
 
-            if (effect->bypass)
+            if (effect->bypass > 0.5f)
             {
                 // effect is now bypassed, but wasn't before
                 if (!effect->was_bypassed)
@@ -1159,7 +1179,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
             sem_post(&g_postevents_semaphore);
     }
 
-    effect->was_bypassed = effect->bypass;
+    effect->was_bypassed = effect->bypass > 0.5f;
 
     return 0;
 }
@@ -1173,7 +1193,7 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
         effect_t *effect = &g_effects[mcc->effect_id];
 
         const bool bypassed = mvalue < mvaluediv;
-        effect->bypass = bypassed;
+        effect->bypass = bypassed ? 1.0f : 0.0f;
 
         if (effect->enabled_index >= 0)
         {
@@ -1364,9 +1384,9 @@ static int ProcessMidi(jack_nframes_t nframes, void *arg)
 
         for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
         {
-            if (g_midi_cc_list[j].effect_id == MIDI_LEARN_NULL)
+            if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
                 break;
-            if (g_midi_cc_list[j].effect_id == MIDI_LEARN_UNUSED)
+            if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
                 continue;
 
             // TODO: avoid race condition against effects_midi_unmap
@@ -1606,6 +1626,11 @@ static property_t *FindEffectPropertyByLabel(effect_t *effect, const char *label
 
 static port_t *FindEffectInputPortBySymbol(effect_t *effect, const char *control_symbol)
 {
+    if (!strcmp(control_symbol, g_bypass_port_symbol))
+        return &effect->bypass_port;
+    if (!strcmp(control_symbol, g_presets_port_symbol))
+        return &effect->presets_port;
+
     for (uint32_t i = 0; i < effect->input_control_ports_count; i++)
     {
         if (strcmp(effect->input_control_ports[i]->symbol, control_symbol) == 0)
@@ -1805,6 +1830,77 @@ static void FreeLicenseData(MOD_License_Handle handle, char *license)
     UNUSED_PARAM(handle);
 }
 
+#ifdef HAVE_CONTROLCHAIN
+static void CCDataUpdate(void* arg)
+{
+    cc_update_list_t *updates = arg;
+
+    bool is_bypass, needs_post = false;
+    const int device_id = updates->device_id;
+
+    for (int i = 0; i < updates->count; i++)
+    {
+        cc_update_data_t *data = &updates->list[i];
+        assignment_t *assignment =
+            &g_assignments_list[device_id][data->assignment_id];
+
+        if (!assignment->port)
+            continue;
+
+        // invert value if bypass
+        if ((is_bypass = !strcmp(assignment->port->symbol, g_bypass_port_symbol)))
+            data->value = 1.0f - data->value;
+
+        // ignore requests for same value
+        if (!floats_differ_enough(*(assignment->port->buffer), data->value))
+            continue;
+
+        if (is_bypass)
+        {
+            effect_t *effect = &g_effects[assignment->effect_id];
+            if (effect->enabled_index >= 0)
+                *(effect->ports[effect->enabled_index]->buffer) = (data->value > 0.5f) ? 0.0f : 1.0f;
+        }
+
+        *(assignment->port->buffer) = data->value;
+
+        postponed_event_list_data* const posteventptr =
+            rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+        if (posteventptr == NULL)
+            continue;
+
+        const postponed_event_t pevent = {
+            POSTPONED_PARAM_SET,
+            assignment->effect_id,
+            assignment->port->symbol,
+            -1, -1,
+            data->value,
+            0.0f, 0.0f
+        };
+        memcpy(&posteventptr->event, &pevent, sizeof(postponed_event_t));
+
+        pthread_mutex_lock(&g_rtsafe_mutex);
+        list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+        pthread_mutex_unlock(&g_rtsafe_mutex);
+
+        needs_post = true;
+    }
+
+    if (needs_post)
+        sem_post(&g_postevents_semaphore);
+}
+
+static void InitializeControlChainIfNeeded(void)
+{
+    if (g_cc_client != NULL)
+        return;
+
+    if ((g_cc_client = cc_client_new("/tmp/control-chain.sock")) != NULL)
+        cc_client_data_update_cb(g_cc_client, CCDataUpdate);
+}
+#endif
+
 /*
 ************************************************************************************************************************
 *           GLOBAL FUNCTIONS
@@ -2001,12 +2097,25 @@ int effects_init(void* client)
         g_midi_cc_list[i].controller = 0;
         g_midi_cc_list[i].minimum = 0.0f;
         g_midi_cc_list[i].maximum = 1.0f;
-        g_midi_cc_list[i].effect_id = MIDI_LEARN_NULL;
+        g_midi_cc_list[i].effect_id = ASSIGNMENT_NULL;
         g_midi_cc_list[i].symbol = NULL;
         g_midi_cc_list[i].port = NULL;
     }
     g_midi_learning = NULL;
     g_midi_program_listen = 0;
+
+#ifdef HAVE_CONTROLCHAIN
+    /* Init the control chain variables */
+    memset(&g_assignments_list, 0, sizeof(g_assignments_list));
+
+    for (int i = 0; i < CC_MAX_DEVICES; i++)
+    {
+        for (int j = 0; j < CC_MAX_ASSIGNMENTS; j++)
+        {
+            g_assignments_list[i][j].effect_id = ASSIGNMENT_NULL;
+        }
+    }
+#endif
 
     g_postevents_running = 1;
     g_postevents_ready = true;
@@ -2060,6 +2169,15 @@ int effects_finish(int close_client)
     pthread_join(g_postevents_thread, NULL);
 
     effects_remove(REMOVE_ALL);
+
+#ifdef HAVE_CONTROLCHAIN
+    if (g_cc_client)
+    {
+        cc_client_delete(g_cc_client);
+        g_cc_client = NULL;
+    }
+#endif
+
     if (g_capture_ports) jack_free(g_capture_ports);
     if (g_playback_ports) jack_free(g_playback_ports);
     if (close_client) jack_client_close(g_jack_global_client);
@@ -2760,8 +2878,32 @@ int effects_add(const char *uid, int instance)
     lilv_nodes_free(properties);
 
     /* Default value of bypass */
-    effect->bypass = false;
-    effect->was_bypassed = true;
+    effect->bypass = 0.0f;
+    effect->was_bypassed = false;
+
+    effect->bypass_port.buffer_count = 1;
+    effect->bypass_port.buffer = &effect->bypass;
+    effect->bypass_port.min_value = 0.0f;
+    effect->bypass_port.max_value = 1.0f;
+    effect->bypass_port.def_value = 0.0f;
+    effect->bypass_port.prev_value = 0.0f;
+    effect->bypass_port.type = TYPE_CONTROL;
+    effect->bypass_port.flow = FLOW_INPUT;
+    effect->bypass_port.hints = HINT_TOGGLE;
+    effect->bypass_port.symbol = g_bypass_port_symbol;
+
+    // virtual presets port
+    effect->preset_value = 0.0f;
+    effect->presets_port.buffer_count = 1;
+    effect->presets_port.buffer = &effect->preset_value;
+    effect->presets_port.min_value = 0.0f;
+    effect->presets_port.max_value = 1.0f;
+    effect->presets_port.def_value = 0.0f;
+    effect->presets_port.prev_value = 0.0f;
+    effect->presets_port.type = TYPE_CONTROL;
+    effect->presets_port.flow = FLOW_INPUT;
+    effect->presets_port.hints = HINT_ENUMERATION|HINT_INTEGER;
+    effect->presets_port.symbol = g_presets_port_symbol;
 
     lilv_node_free(lilv_audio);
     lilv_node_free(lilv_control);
@@ -2874,7 +3016,7 @@ int effects_preset_load(int effect_id, const char *uri)
             // force state of special designated ports
             if (effect->enabled_index >= 0)
             {
-                *(effect->ports[effect->enabled_index]->buffer) = effect->bypass > 0.5f ? 0.0 : 1.0f;
+                *(effect->ports[effect->enabled_index]->buffer) = effect->bypass > 0.5f ? 0.0f : 1.0f;
             }
             if (effect->freewheel_index >= 0)
             {
@@ -3007,12 +3149,16 @@ int effects_remove(int effect_id)
 
             FreeFeatures(effect);
 
-            if (effect->ports)
+            if (effect->event_ports)
             {
                 for (i = 0; i < effect->event_ports_count; i++)
                 {
                     lv2_evbuf_free(effect->event_ports[i]->evbuf);
                 }
+            }
+
+            if (effect->ports)
+            {
                 for (i = 0; i < effect->ports_count; i++)
                 {
                     if (effect->ports[i])
@@ -3059,10 +3205,43 @@ int effects_remove(int effect_id)
             g_midi_cc_list[j].controller = 0;
             g_midi_cc_list[j].minimum = 0.0f;
             g_midi_cc_list[j].maximum = 1.0f;
-            g_midi_cc_list[j].effect_id = MIDI_LEARN_NULL;
+            g_midi_cc_list[j].effect_id = ASSIGNMENT_NULL;
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
         }
+
+#ifdef HAVE_CONTROLCHAIN
+        if (g_cc_client)
+        {
+            for (int i = 0; i < CC_MAX_DEVICES; i++)
+            {
+                for (int j = 0; j < CC_MAX_ASSIGNMENTS; j++)
+                {
+                    assignment_t *assignment = &g_assignments_list[i][j];
+
+                    if (assignment->effect_id == ASSIGNMENT_NULL)
+                        break;
+                    if (assignment->effect_id == ASSIGNMENT_UNUSED)
+                        continue;
+
+                    cc_assignment_key_t key;
+                    key.device_id = assignment->device_id;
+                    key.id = assignment->assignment_id;
+                    cc_client_unassignment(g_cc_client, &key);
+                }
+            }
+        }
+
+        memset(&g_assignments_list, 0, sizeof(g_assignments_list));
+
+        for (int i = 0; i < CC_MAX_DEVICES; i++)
+        {
+            for (int j = 0; j < CC_MAX_ASSIGNMENTS; j++)
+            {
+                g_assignments_list[i][j].effect_id = ASSIGNMENT_NULL;
+            }
+        }
+#endif
 
         // reset all events
         pthread_mutex_lock(&g_rtsafe_mutex);
@@ -3085,7 +3264,7 @@ int effects_remove(int effect_id)
         pthread_mutex_lock(&g_midi_learning_mutex);
         if (g_midi_learning != NULL && g_midi_learning->effect_id == effect_id)
         {
-            g_midi_learning->effect_id = MIDI_LEARN_UNUSED;
+            g_midi_learning->effect_id = ASSIGNMENT_UNUSED;
             g_midi_learning->symbol = NULL;
             g_midi_learning->port = NULL;
             g_midi_learning = NULL;
@@ -3094,14 +3273,14 @@ int effects_remove(int effect_id)
 
         for (j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
         {
-            if (g_midi_cc_list[j].effect_id == MIDI_LEARN_NULL)
+            if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
                 break;
-            if (g_midi_cc_list[j].effect_id == MIDI_LEARN_UNUSED)
+            if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
                 continue;
             if (g_midi_cc_list[j].effect_id != effect_id)
                 continue;
 
-            g_midi_cc_list[j].effect_id = MIDI_LEARN_UNUSED;
+            g_midi_cc_list[j].effect_id = ASSIGNMENT_UNUSED;
             g_midi_cc_list[j].channel = -1;
             g_midi_cc_list[j].controller = 0;
             g_midi_cc_list[j].minimum = 0.0f;
@@ -3109,6 +3288,34 @@ int effects_remove(int effect_id)
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
         }
+
+#ifdef HAVE_CONTROLCHAIN
+        for (int i = 0; i < CC_MAX_DEVICES; i++)
+        {
+            for (int j = 0; j < CC_MAX_ASSIGNMENTS; j++)
+            {
+                assignment_t *assignment = &g_assignments_list[i][j];
+
+                if (assignment->effect_id == ASSIGNMENT_NULL)
+                    break;
+                if (assignment->effect_id == ASSIGNMENT_UNUSED)
+                    continue;
+                if (assignment->effect_id != effect_id)
+                    continue;
+
+                if (g_cc_client)
+                {
+                    cc_assignment_key_t key;
+                    key.device_id = assignment->device_id;
+                    key.id = assignment->assignment_id;
+                    cc_client_unassignment(g_cc_client, &key);
+                }
+
+                memset(assignment, 0, sizeof(assignment_t));
+                assignment->effect_id = ASSIGNMENT_UNUSED;
+            }
+        }
+#endif
 
         // flush events for all effects except this one
         RunPostPonedEvents(effect_id);
@@ -3438,7 +3645,7 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
     pthread_mutex_lock(&g_midi_learning_mutex);
     if (g_midi_learning != NULL)
     {
-        g_midi_learning->effect_id = MIDI_LEARN_UNUSED;
+        g_midi_learning->effect_id = ASSIGNMENT_UNUSED;
         g_midi_learning->symbol = NULL;
         g_midi_learning->port = NULL;
         g_midi_learning = NULL;
@@ -3448,9 +3655,9 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
     // if already mapped set it to re-learn
     for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
     {
-        if (g_midi_cc_list[i].effect_id == MIDI_LEARN_NULL)
+        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_NULL)
             break;
-        if (g_midi_cc_list[i].effect_id == MIDI_LEARN_UNUSED)
+        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_UNUSED)
             continue;
         if (g_midi_cc_list[i].effect_id != effect_id)
             continue;
@@ -3523,9 +3730,9 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
     // update current mapping first if it exists
     for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
     {
-        if (g_midi_cc_list[i].effect_id == MIDI_LEARN_NULL)
+        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_NULL)
             break;
-        if (g_midi_cc_list[i].effect_id == MIDI_LEARN_UNUSED)
+        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_UNUSED)
             continue;
         if (g_midi_cc_list[i].effect_id != effect_id)
             continue;
@@ -3586,9 +3793,9 @@ int effects_midi_unmap(int effect_id, const char *control_symbol)
 
     for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
     {
-        if (g_midi_cc_list[i].effect_id == MIDI_LEARN_NULL)
+        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_NULL)
             break;
-        if (g_midi_cc_list[i].effect_id == MIDI_LEARN_UNUSED)
+        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_UNUSED)
             continue;
         if (g_midi_cc_list[i].effect_id != effect_id)
             continue;
@@ -3604,7 +3811,7 @@ int effects_midi_unmap(int effect_id, const char *control_symbol)
         g_midi_cc_list[i].controller = 0;
         g_midi_cc_list[i].minimum = 0.0f;
         g_midi_cc_list[i].maximum = 1.0f;
-        g_midi_cc_list[i].effect_id = MIDI_LEARN_UNUSED;
+        g_midi_cc_list[i].effect_id = ASSIGNMENT_UNUSED;
         g_midi_cc_list[i].symbol = NULL;
         g_midi_cc_list[i].port = NULL;
         return SUCCESS;
@@ -3646,6 +3853,167 @@ void effects_midi_program_listen(int enable, int channel)
         channel = -1;
 
     g_midi_program_listen = channel;
+}
+
+int effects_cc_map(int effect_id, const char *control_symbol, int device_id, int actuator_id,
+                   const char *label, float value, float minimum, float maximum, int steps, const char *unit,
+                   int scalepoints_count, const scalepoint_t *scalepoints)
+{
+#ifdef HAVE_CONTROLCHAIN
+    InitializeControlChainIfNeeded();
+
+    if (!InstanceExist(effect_id))
+        return ERR_INSTANCE_NON_EXISTS;
+    if (!g_cc_client)
+        return ERR_CONTROL_CHAIN_UNAVAILABLE;
+    if (scalepoints_count == 1)
+        return ERR_ASSIGNMENT_INVALID_OP;
+
+    effect_t *effect = &(g_effects[effect_id]);
+    port_t *port = FindEffectInputPortBySymbol(effect, control_symbol);
+
+    if (port == NULL)
+        return ERR_LV2_INVALID_PARAM_SYMBOL;
+
+    cc_assignment_t assignment;
+    assignment.device_id = device_id;
+    assignment.actuator_id = actuator_id;
+    assignment.mode  = 0x0;
+    assignment.label = label;
+    assignment.value = value;
+    assignment.min   = minimum;
+    assignment.max   = maximum;
+    assignment.def   = port->def_value;
+    assignment.steps = steps;
+    assignment.unit  = unit;
+    assignment.list_count = scalepoints_count;
+
+    cc_item_t *item_data;
+
+    if (scalepoints_count >= 2)
+    {
+        item_data = malloc(sizeof(cc_item_t)*scalepoints_count);
+        assignment.list_items = malloc(sizeof(cc_item_t*)*scalepoints_count);
+
+        if (assignment.list_items != NULL && item_data != NULL)
+        {
+            assignment.mode = CC_MODE_OPTIONS;
+
+            for (int i = 0; i < scalepoints_count; i++)
+            {
+                item_data[i].label = scalepoints[i].label;
+                item_data[i].value = scalepoints[i].value;
+                assignment.list_items[i] = item_data + i;
+            }
+        }
+        else
+        {
+            free(item_data);
+            free(assignment.list_items);
+            return ERR_MEMORY_ALLOCATION;
+        }
+    }
+    else
+    {
+        item_data = NULL;
+        assignment.list_items = NULL;
+
+        if (port->hints & HINT_TOGGLE)
+            assignment.mode = CC_MODE_TOGGLE;
+        if (port->hints & HINT_TRIGGER)
+            assignment.mode = CC_MODE_TRIGGER;
+    }
+
+    if (!strcmp(control_symbol, g_bypass_port_symbol))
+    {
+        // invert value for bypass
+        assignment.value = value > 0.5f ? 0.0f : 1.0f;
+        assignment.def = 1.0f;
+    }
+    else if (!strcmp(control_symbol, g_presets_port_symbol))
+    {
+        // virtual presets port
+        port->min_value = minimum;
+        port->max_value = maximum;
+        port->def_value = port->prev_value = *port->buffer = value;
+    }
+
+    const int assignment_id = cc_client_assignment(g_cc_client, &assignment);
+
+    free(item_data);
+    free(assignment.list_items);
+
+    if (assignment_id < 0)
+    {
+        return ERR_ASSIGNMENT_FAILED;
+    }
+
+    assignment_t *item = &g_assignments_list[assignment.device_id][assignment_id];
+
+    item->effect_id = effect_id;
+    item->port = port;
+    item->device_id = device_id;
+    item->assignment_id = assignment_id;
+
+    return SUCCESS;
+#else
+    return ERR_CONTROL_CHAIN_UNAVAILABLE;
+
+    UNUSED_PARAM(effect_id);
+    UNUSED_PARAM(control_symbol);
+    UNUSED_PARAM(device_id);
+    UNUSED_PARAM(actuator_id);
+    UNUSED_PARAM(label);
+    UNUSED_PARAM(value);
+    UNUSED_PARAM(minimum);
+    UNUSED_PARAM(maximum);
+    UNUSED_PARAM(steps);
+    UNUSED_PARAM(unit);
+    UNUSED_PARAM(scalepoints_count);
+    UNUSED_PARAM(scalepoints);
+#endif
+}
+
+int effects_cc_unmap(int effect_id, const char *control_symbol)
+{
+#ifdef HAVE_CONTROLCHAIN
+    if (!InstanceExist(effect_id))
+        return ERR_INSTANCE_NON_EXISTS;
+    if (!g_cc_client)
+        return ERR_CONTROL_CHAIN_UNAVAILABLE;
+
+    for (int i = 0; i < CC_MAX_DEVICES; i++)
+    {
+        for (int j = 0; j < CC_MAX_ASSIGNMENTS; j++)
+        {
+            assignment_t *assignment = &g_assignments_list[i][j];
+
+            if (assignment->effect_id == ASSIGNMENT_NULL)
+                break;
+
+            if (assignment->effect_id == effect_id && assignment->port != NULL &&
+                strcmp(assignment->port->symbol, control_symbol) == 0)
+            {
+                cc_assignment_key_t key;
+                key.device_id = assignment->device_id;
+                key.id = assignment->assignment_id;
+
+                memset(assignment, 0, sizeof(assignment_t));
+                assignment->effect_id = ASSIGNMENT_UNUSED;
+
+                cc_client_unassignment(g_cc_client, &key);
+                return SUCCESS;
+            }
+        }
+    }
+
+    return ERR_ASSIGNMENT_INVALID_OP;
+#else
+    return ERR_CONTROL_CHAIN_UNAVAILABLE;
+
+    UNUSED_PARAM(effect_id);
+    UNUSED_PARAM(control_symbol);
+#endif
 }
 
 float effects_jack_cpu_load(void)
